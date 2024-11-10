@@ -1,3 +1,4 @@
+import os
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
@@ -16,7 +17,7 @@ class GenerationRequest(BaseModel):
     temperature: Optional[float] = 1.0
 
 class GenerationResponse(BaseModel):
-    generated_texts: List[str]
+    generated_text: str
 
 @dataclass
 class QueueItem:
@@ -36,8 +37,8 @@ class BatchProcessor:
         
         # Model initialization
         self.model_id = "FasterDecoding/medusa-v1.0-vicuna-7b-v1.5"
-        self.model_onnx_path ="/home/arusia/medusa/onnxruntime/onnxruntime/python/tools/transformers/models/medusa/medusa-tiny/rank_0_medusa-v1.0-vicuna-7b-v1.5_decoder_merged_model_fp16.onnx"
-        self.cache_dir = "../.cache/huggingface/hub"
+        self.model_onnx_path ="onnx-medusa/medusa-onnx/rank_0_medusa-v1.0-vicuna-7b-v1.5_decoder_merged_model_fp16.onnx"
+        self.cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
 
         
         # Initialize model components
@@ -166,6 +167,6 @@ async def generate(request: GenerationRequest):
             temperature=request.temperature
         )
         result = await future
-        return GenerationResponse(generated_texts=result)
+        return GenerationResponse(generated_text=result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

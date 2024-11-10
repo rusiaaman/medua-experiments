@@ -6,7 +6,6 @@ from modeling_llama_kv import LlamaForCausalLM as KVLlamaForCausalLM
 from transformers import PreTrainedModel, PretrainedConfig
 import onnxruntime as ort
 from utils import generate_candidates, evaluate_posterior, generate_medusa_buffers, update_inference_inputs, reset_medusa_mode
-from kv_cache import initialize_past_key_values
 from transformers import AutoTokenizer, AutoConfig
 import os
 from huggingface_hub import hf_hub_download

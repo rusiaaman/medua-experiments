@@ -9,7 +9,6 @@ from modeling_llama_kv import LlamaForCausalLM as KVLlamaForCausalLM
 
 from transformers import PreTrainedModel, PretrainedConfig
 from utils import *
-from kv_cache import initialize_past_key_values
 from transformers import AutoTokenizer, AutoConfig, AutoModel
 import os
 from huggingface_hub import hf_hub_download

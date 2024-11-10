@@ -1,0 +1,4 @@
+{
+    "mypy-type-checker.args": ["--check-untyped-defs"],
+    "mypy.extraArguments": ["--check-untyped-defs"],
+}
