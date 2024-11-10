@@ -109,6 +109,7 @@ def tree_decoding(
     retrieve_indices,
     medusa_attn_mask,
     input_ids,
+    medusa_position_ids,
 ):
     # tree_medusa_logits, outputs, tree_logits = model(
     #     tree_candidates,
@@ -124,10 +125,14 @@ def tree_decoding(
     seq_len = tree_candidates.shape[1]
 
     position_ids = torch.arange(
-        0, seq_len, dtype=torch.long
-    ).unsqueeze(0).expand(bsz, -1)
+        0, past_input_ids_len, dtype=torch.long
+    )
+    position_ids = torch.cat(
+        [position_ids, medusa_position_ids + past_input_ids_len], dim=0
+    )
+    
+    position_ids = position_ids.unsqueeze(0).expand(bsz, -1)
     attention_mask = torch.ones((bsz, seq_len), dtype=torch.long,)
-
 
     # Expand medusa_mask to enable casting
     pad_to = max(0, seq_len - medusa_attn_mask.shape[-1])
@@ -155,7 +160,7 @@ def tree_decoding(
     # Reorder the obtained logits based on the retrieve_indices to ensure consistency with some reference ordering.
     logits = outputs['logits'][0, past_input_ids_len + retrieve_indices]
     medusa_logits = outputs['medusa_logits'][:, 0, past_input_ids_len + retrieve_indices]
-    return medusa_logits, logits
+    return medusa_logits, logits, outputs['logits']
 
 
 class MedusaModel:
@@ -242,20 +247,20 @@ class MedusaModel:
             )
 
             # Use tree attention to verify the candidates and get predictions
-            medusa_logits, logits = tree_decoding(
+            medusa_logits, logits, rawlogits = tree_decoding(
                 self.model, 
                 self.config,
                 tree_candidates,
                 medusa_buffers["retrieve_indices"],
                 medusa_buffers["medusa_attn_mask"],
-                input_ids
+                input_ids,
+                medusa_buffers["medusa_position_ids"]
             )
 
             # Evaluate the posterior of the candidates to select the accepted candidate prefix
             best_candidate, accept_length = evaluate_posterior(
                 logits, candidates, temperature, posterior_threshold, posterior_alpha, top_p=top_p, sampling=sampling, fast=fast
             )
-
             # Update the input_ids and logits
             input_ids, logits, medusa_logits, new_token = update_inference_inputs(
                 input_ids,
@@ -267,6 +272,7 @@ class MedusaModel:
                 medusa_logits,
                 new_token,
             )
+            
 
             yield {
                 "text": self.tokenizer.decode(

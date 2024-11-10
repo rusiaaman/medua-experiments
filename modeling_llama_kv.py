@@ -814,11 +814,10 @@ class LlamaModel(LlamaPreTrainedModel):
 
         # # [MODIFIED] add medusa mask
         combined_attention_mask = torch.where(
-            medusa_mask == 0,
+            medusa_mask < 0.5,
             torch.finfo(inputs_embeds.dtype).min,
             combined_attention_mask
         )
-
 
         return combined_attention_mask
 
