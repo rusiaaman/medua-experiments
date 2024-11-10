@@ -1,30 +1,159 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
-from transformers import LlamaConfig, LlamaTokenizer
+import asyncio
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 import numpy as np
 import onnxruntime as ort
 import torch
+from transformers import LlamaConfig, LlamaTokenizer
 from contextlib import asynccontextmanager
 
+# Request/Response models
 class GenerationRequest(BaseModel):
     prompt: str
-    max_length: Optional[int] = 64
+    max_length: int
 
 class GenerationResponse(BaseModel):
-    generated_texts: str
+    generated_text: str
 
-model_name = "meta-llama/Llama-2-7b-hf"
-onnx_model_path = "./llama2-7b-fp16-gqa/rank_0_vicuna-7b-v1.5_decoder_merged_model_fp16.onnx"
-cache_dir = './cache_dir'
-config = LlamaConfig.from_pretrained(model_name, use_auth_token=True, cache_dir=cache_dir)
-tokenizer = LlamaTokenizer.from_pretrained(model_name, use_auth_token=True, cache_dir=cache_dir)
+@dataclass
+class QueueItem:
+    prompt: str
+    max_length: int
+    future: asyncio.Future
 
-sess_options = ort.SessionOptions()
-ep = ("CPUExecutionProvider", {})
-model = ort.InferenceSession(onnx_model_path, sess_options=sess_options, providers=[ep])
+class BatchProcessor:
+    def __init__(self, batch_size=4, max_wait_time=0.5):
+        self.queue = asyncio.Queue[QueueItem]()
+        self.batch_size = batch_size
+        self.max_wait_time = max_wait_time
+        self.is_running = False
+        self.model_name = "meta-llama/Llama-2-7b-hf"
+        self.onnx_model_path = "./llama2-7b-fp16-gqa/rank_0_vicuna-7b-v1.5_decoder_merged_model_fp16.onnx"
+        self.cache_dir = './cache_dir'
+        
+        # Initialize model components
+        self.config = LlamaConfig.from_pretrained(
+            self.model_name, 
+            use_auth_token=True, 
+            cache_dir=self.cache_dir
+        )
+        self.tokenizer = LlamaTokenizer.from_pretrained(
+            self.model_name, 
+            use_auth_token=True, 
+            cache_dir=self.cache_dir
+        )
+        
+        sess_options = ort.SessionOptions()
+        ep = ("CPUExecutionProvider", {})
+        self.model = ort.InferenceSession(
+            self.onnx_model_path, 
+            sess_options=sess_options, 
+            providers=[ep]
+        )
 
-app = FastAPI()
+    async def start(self):
+        """Start the batch processor worker"""
+        self.is_running = True
+        asyncio.create_task(self._process_batches())
+
+    async def stop(self):
+        """Stop the batch processor worker"""
+        self.is_running = False
+        
+    async def add_to_queue(self, prompt: str, max_length: int) -> asyncio.Future[str]:
+        """Add a request to the queue and return a future for the result"""
+        future = asyncio.Future[str]()
+        request_id = id(future)
+        item = QueueItem(
+            prompt=prompt,
+            max_length=max_length,
+            future=future,
+        )
+        await self.queue.put(item)
+        return future
+
+    async def _process_batches(self):
+        """Main worker loop that processes batches of requests"""
+        while self.is_running:
+            batch: list[QueueItem] = []
+            try:
+                # Get the first item and start the batch
+                first_item = await self.queue.get()
+                batch.append(first_item)
+                batch_deadline = datetime.now() + timedelta(seconds=self.max_wait_time)
+
+                # Try to fill the batch
+                while len(batch) < self.batch_size and datetime.now() < batch_deadline:
+                    try:
+                        item = await asyncio.wait_for(
+                            self.queue.get(),
+                            timeout=(batch_deadline - datetime.now()).total_seconds()
+                        )
+                        batch.append(item)
+                    except asyncio.TimeoutError:
+                        break
+                print(len(batch))
+                # Process the batch
+                prompts = [item.prompt for item in batch]
+                max_length = max(item.max_length for item in batch)
+                
+                try:
+                    results = await generate_text(
+                        prompts=prompts,
+                        max_length=max_length,
+                        model=self.model,
+                        tokenizer=self.tokenizer,
+                        config=self.config
+                    )
+                    
+                    # Set results for each future
+                    for item, result in zip(batch, results):
+                        if not item.future.done():
+                            item.future.set_result(result)
+                            
+                except Exception as e:
+                    # Handle errors by setting exception for all futures in batch
+                    for item in batch:
+                        if not item.future.done():
+                            item.future.set_exception(e)
+                            
+            except Exception as e:
+                # Handle unexpected errors in the worker loop
+                for item in batch:
+                    if not item.future.done():
+                        item.future.set_exception(e)
+            finally:
+                # Mark all items in batch as done
+                for _ in batch:
+                    self.queue.task_done()
+
+# Initialize FastAPI app and batch processor
+batch_processor = BatchProcessor()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await batch_processor.start()
+    yield
+    await batch_processor.stop()
+
+app = FastAPI(lifespan=lifespan)
+
+@app.post("/generate")
+async def generate(request: GenerationRequest):
+    try:
+        future = await batch_processor.add_to_queue(
+            prompt=request.prompt,
+            max_length=request.max_length
+        )
+        result = await future
+        return GenerationResponse(generated_text=result)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 def get_initial_inputs_and_outputs(config, tokenizer, prompt, device, use_fp16, use_buffer_share):
     tokenizer.pad_token = "[PAD]"
@@ -120,12 +249,21 @@ def apply_io_binding(model, inputs, outputs, use_fp16, use_buffer_share):
 
     return io_binding
 
-async def generate_text(prompts: List[str], max_length: int = 64) -> List[str]:
+# Modify the generate_text function to accept model components as parameters
+async def generate_text(
+    prompts: List[str],
+    max_length: int,
+    model: ort.InferenceSession,
+    tokenizer: LlamaTokenizer,
+    config: LlamaConfig
+) -> List[str]:
     use_fp16 = True
     use_buffer_share = True
     device = 'cpu'
     
-    inputs, outputs = get_initial_inputs_and_outputs(config, tokenizer, , device, use_fp16, use_buffer_share)
+    inputs, outputs = get_initial_inputs_and_outputs(
+        config, tokenizer, prompts, device, use_fp16, use_buffer_share
+    )
     
     all_token_ids = inputs["input_ids"].clone()
     batch_size, sequence_length = all_token_ids.shape
@@ -182,18 +320,5 @@ async def generate_text(prompts: List[str], max_length: int = 64) -> List[str]:
 
     return tokenizer.batch_decode(all_token_ids, skip_special_tokens=True)
 
-@app.post("/generate", response_model=GenerationResponse)
-async def generate(request: GenerationRequest):
-    try:
-        generated_texts = await generate_text(request.prompts, request.max_length)
-        return GenerationResponse(generated_texts=generated_texts)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/health")
-async def health_check():
-    if tokenizer is None or model is None or config is None:
-        raise HTTPException(status_code=503, detail="Model components not loaded")
-    return {"status": "healthy"}
-
-
+    
