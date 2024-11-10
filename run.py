@@ -1,19 +1,19 @@
-from transformers import LlamaConfig, LlamaTokenizer
+from transformers import AutoConfig, AutoTokenizer
 import numpy as np
 import onnxruntime as ort
 import torch
 
-model_name = "meta-llama/Llama-2-7b-hf"  # Model name in Hugging Face
-onnx_model_path = "./llama2-7b-fp16-gqa/rank_0_vicuna-7b-v1.5_decoder_merged_model_fp16.onnx"  # Path to exported ONNX model on disk
+model_name = "FasterDecoding/medusa-v1.0-vicuna-7b-v1.5"  # Model name in Hugging Face
+onnx_model_path = "/home/arusia/medusa/onnxruntime/onnxruntime/python/tools/transformers/models/medusa/medusa-tiny/rank_0_medusa-v1.0-vicuna-7b-v1.5_decoder_merged_model_fp16.onnx"  # Path to exported ONNX model on disk
 use_fp16 = True  # True when KV cache inputs/outputs are in float16
 use_buffer_share = True 
-cache_dir = './cache_dir'
+cache_dir = '/home/arusia/.cache/huggingface/hub/'
 
-max_length = 64  # max(prompt length + generation length)
-config = LlamaConfig.from_pretrained(model_name, use_auth_token=True, cache_dir=cache_dir)
-tokenizer = LlamaTokenizer.from_pretrained(model_name, use_auth_token=True, cache_dir=cache_dir)
+max_iterations = 10  # max(prompt length + generation length)
+config = AutoConfig.from_pretrained(model_name, use_auth_token=True, cache_dir=cache_dir)
+tokenizer = AutoTokenizer.from_pretrained(model_name, use_auth_token=True, cache_dir=cache_dir)
 torch_dtype = torch.float16 if use_fp16 else torch.float32
-
+prompt = ["""1 + 1 = """]  # Prompt for generation
 def get_initial_inputs_and_outputs(config, tokenizer, prompt, device, use_fp16, use_buffer_share):
     tokenizer.pad_token = "[PAD]"  # Set pad token for tokenizer
     encodings_dict = tokenizer.batch_encode_plus(prompt, padding=True)
@@ -22,9 +22,13 @@ def get_initial_inputs_and_outputs(config, tokenizer, prompt, device, use_fp16, 
     # Move inputs from tokenizer to on-device memory
     input_ids = torch.tensor(encodings_dict["input_ids"], device=device, dtype=torch.int64)
     attention_mask = torch.tensor(encodings_dict["attention_mask"], device=device, dtype=torch.int64)
+    bsz = input_ids.shape[0]
+    sequence_length = input_ids.shape[1]
     inputs = {
         "input_ids": input_ids.contiguous(),
         "attention_mask": attention_mask.contiguous(),
+        "position_ids": torch.arange(input_ids.shape[1], device=device, dtype=torch.long).unsqueeze(0).expand(bsz, -1).contiguous(),
+        "medusa_mask": torch.ones((1, 1, sequence_length, sequence_length), device=device, dtype=torch_dtype).contiguous()
     }
     # Pre-allocate on-device memory for past_key_values (past KV cache)
     # Share on-device memory if use_buffer_share is True
@@ -112,7 +116,7 @@ def apply_io_binding(model, inputs, outputs, use_fp16, use_buffer_share):
                 shape=tuple(v.shape),
                 buffer_ptr=v.data_ptr()
             )
-        else:
+        elif name in outputs:
             v = outputs[name]
             io_binding.bind_output(
                 name=name,
@@ -133,12 +137,13 @@ num_heads, head_size = config.num_key_value_heads, config.hidden_size // config.
 current_length = sequence_length  # keep track of current length (prompt length + generation length)
 has_eos = torch.zeros(batch_size, device='cpu', dtype=torch.bool)  # keep track of each batch entry's status and whether it has reached end-of-sequence (EOS) or not
 
-while current_length <= max_length:
+for _ in range(max_iterations):
     # Run inference
     io_binding = apply_io_binding(model, inputs, outputs, use_fp16, use_buffer_share)
     io_binding.synchronize_inputs()
     model.run_with_iobinding(io_binding)
     io_binding.synchronize_outputs()
+    
 
     # Sample/choose next token with argmax (greedy search)
     if outputs["logits"].shape[1] > 1:
@@ -162,17 +167,15 @@ while current_length <= max_length:
     # 2) we have reached the max length of a batch entry (prompt length + generation length) or
     # 3) max sequence length that the model can support
     current_length += 1
-    if torch.all(has_eos) or current_length > max_length or current_length > max_sequence_length:
+    if torch.all(has_eos) or current_length > max_sequence_length:
         break
 
     # Update inputs for next inference run
-    inputs["input_ids"] = tokens_to_add
+    inputs["input_ids"] = all_token_ids
+    inputs['position_ids'] = torch.arange(all_token_ids.shape[1], device='cpu', dtype=torch.long).unsqueeze(0).expand(batch_size, -1).contiguous()
     inputs["attention_mask"] = torch.cat([inputs["attention_mask"], (~has_eos).to(torch.int64).reshape(batch_size, 1)], 1)
-
-    # Set logits to zeros for next inference run and re-use memory buffer
-    if outputs["logits"].shape[1] != 1:
-        outputs["logits"] = outputs["logits"][:, :1, :].contiguous()
-    outputs["logits"].zero_()
+    inputs['medusa_mask'] = torch.ones((1, 1, all_token_ids.shape[1], all_token_ids.shape[1]), device='cpu', dtype=torch_dtype).contiguous()
+    outputs["logits"] = torch.zeros(batch_size, all_token_ids.shape[1], config.vocab_size, device='cpu', dtype=torch_dtype)
 
     # If buffer sharing is off, pass the present KV cache from previous iteration as the past KV cache for next iteration
     if not use_buffer_share:
@@ -189,5 +192,5 @@ while current_length <= max_length:
                 f"present.{i}.value": present_value.contiguous()
             })
 
-print(tokenizer.batch_decode(all_token_ids, skip_special_tokens=True)
-)
+    print(tokenizer.batch_decode(all_token_ids, skip_special_tokens=True)
+    )

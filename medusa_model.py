@@ -10,7 +10,7 @@ from modeling_llama_kv import LlamaForCausalLM as KVLlamaForCausalLM
 from transformers import PreTrainedModel, PretrainedConfig
 from utils import *
 from kv_cache import initialize_past_key_values
-from transformers import AutoTokenizer, AutoConfig
+from transformers import AutoTokenizer, AutoConfig, AutoModel
 import os
 from huggingface_hub import hf_hub_download
 import warnings
@@ -123,35 +123,33 @@ class MedusaModelLlama(KVLlamaForCausalLM):
         *args,
         **kwargs,
     ):
-        # Manually load config to ensure that the medusa_num_heads parameter is loaded
+        config = MedusaConfig.from_pretrained(pretrained_model_name_or_path)
+        config.base_model_name_or_path = pretrained_model_name_or_path
+        base_model_config = AutoConfig.from_pretrained(config.base_model_name_or_path)
+        base_model_config.medusa_num_heads = 5 # TODO: fix the uploaded config (only include 2 heads)
+        base_model_config.medusa_num_layers = config.medusa_num_layers
+        base_model_config.use_cache = False
+        model = super().from_pretrained(
+            config.base_model_name_or_path,
+            *args,
+            **kwargs,
+            config=base_model_config,
+        )
+        medusa_head_path = "medusa_lm_head.pt"
+        if os.path.exists(medusa_head_path):
+            filename = medusa_head_path
+        else:
+            filename = hf_hub_download(pretrained_model_name_or_path, "medusa_lm_head.pt")
+            
         try:
-            config = AutoConfig.from_pretrained(pretrained_model_name_or_path)
-            return super().from_pretrained(
-                pretrained_model_name_or_path,
-                *args,
-                **kwargs,
-                config=config,
-            )
-        except:
-            config = MedusaConfig.from_pretrained(pretrained_model_name_or_path)
-            base_model_config = AutoConfig.from_pretrained(config.base_model_name_or_path)
-            base_model_config.medusa_num_heads = 5 # TODO: fix the uploaded config (only include 2 heads)
-            base_model_config.medusa_num_layers = config.medusa_num_layers
-            model = super().from_pretrained(
-                config.base_model_name_or_path,
-                *args,
-                **kwargs,
-                config=base_model_config,
-            )
-            medusa_head_path = os.path.join(pretrained_model_name_or_path, "medusa_lm_head.pt")
-            if os.path.exists(medusa_head_path):
-                filename = medusa_head_path
-            else:
-                filename = hf_hub_download(pretrained_model_name_or_path, "medusa_lm_head.pt")
             medusa_head_state_dict = torch.load(filename, map_location=model.device)
             model.medusa_head.load_state_dict(medusa_head_state_dict, strict=False)
-            return model
-        
+        except Exception as e:
+            warnings.warn(f"Failed to load medusa head: {e}")
+
+        return model
+    
+
 
     def get_tokenizer(self):
         """Get the tokenizer of the base model.
@@ -167,8 +165,8 @@ class MedusaModelLlama(KVLlamaForCausalLM):
         input_ids=None,
         attention_mask=None,
         position_ids=None,
-        past_key_values=None,
         medusa_mask=None,
+        past_key_values=None,
         **kwargs,
     ):
         # Pass input through the base model
@@ -188,8 +186,8 @@ class MedusaModelLlama(KVLlamaForCausalLM):
         for i in range(self.medusa):
             medusa_logits.append(self.medusa_head[i](hidden_states))
         return [
-            torch.stack(medusa_logits, dim=0),
             orig,
+            torch.stack(medusa_logits, dim=0),
             outputs.past_key_values
         ]
     

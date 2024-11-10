@@ -1,10 +1,11 @@
 import numpy as np
 import torch
 import torch.nn as nn
+from medusa_model import MedusaConfig
 from modeling_llama_kv import LlamaForCausalLM as KVLlamaForCausalLM
 from transformers import PreTrainedModel, PretrainedConfig
 import onnxruntime as ort
-from utils import *
+from utils import generate_candidates, evaluate_posterior, generate_medusa_buffers, update_inference_inputs, reset_medusa_mode
 from kv_cache import initialize_past_key_values
 from transformers import AutoTokenizer, AutoConfig
 import os
@@ -20,7 +21,7 @@ def apply_io_binding(model, inputs, outputs, use_fp16, use_buffer_share):
     missing_inputs = model_inputs - user_inputs
     if len(missing_inputs):
         print(f"The following model inputs are missing: {missing_inputs}")
-        raise Exception("There are missing inputs to the model. Please add them and try again.")
+        # raise Exception("There are missing inputs to the model. Please add them and try again.")
 
     # Remove unnecessary inputs from model inputs
     unnecessary_inputs = user_inputs - model_inputs
@@ -37,7 +38,7 @@ def apply_io_binding(model, inputs, outputs, use_fp16, use_buffer_share):
         "torch.float32": np.float32,
         "torch.float16": np.float16
     }
-
+    
     for k, v in inputs.items():
         io_binding.bind_input(
             name=k,
@@ -48,7 +49,6 @@ def apply_io_binding(model, inputs, outputs, use_fp16, use_buffer_share):
             buffer_ptr=v.data_ptr()
         )
         device = v.device
-
     for output in model.get_outputs():
         name = output.name
         if use_buffer_share and "present" in name:
@@ -62,7 +62,7 @@ def apply_io_binding(model, inputs, outputs, use_fp16, use_buffer_share):
                 shape=tuple(v.shape),
                 buffer_ptr=v.data_ptr()
             )
-        else:
+        elif name in outputs:
             v = outputs[name]
             io_binding.bind_output(
                 name=name,
@@ -76,15 +76,24 @@ def apply_io_binding(model, inputs, outputs, use_fp16, use_buffer_share):
     return io_binding
 
 
-def initialize_medusa(input_ids, model: ort.InferenceSession, config, device, use_fp16):
+def initialize_medusa(input_ids, model: ort.InferenceSession, config, device, use_fp16, medusa_mask):
     bsz = input_ids.shape[0]
     seq_len = input_ids.shape[1]
-    outputs = {
-        "logits": torch.zeros((bsz, seq_len, config.vocab_size), dtype=torch.float32, device=device),
-        "medusa_logits": torch.zeros((bsz, config.medusa_num_heads, config.medusa_num_choices), dtype=torch.float32, device=device),
-    }
+    position_ids = torch.arange(
+        0, seq_len, dtype=torch.long, device=device
+    ).unsqueeze(0).expand(bsz, -1)
+    attention_mask = torch.ones((bsz, seq_len), dtype=torch.long, device=device)
+
+    
     inputs = {
         "input_ids": input_ids,
+        "position_ids": position_ids,
+        "attention_mask": attention_mask,
+        "medusa_mask": torch.ones((1, 1, seq_len, seq_len), dtype=torch.float16, device=device),
+    }
+    outputs = {
+        "logits": torch.zeros((bsz, seq_len, config.vocab_size), dtype=torch.float16, device=device),
+        "medusa_logits": torch.zeros((config.medusa_num_heads, bsz, seq_len, config.vocab_size), dtype=torch.float16, device=device),
     }
     io_binding = apply_io_binding(model, inputs, outputs, use_fp16, False)
     io_binding.synchronize_inputs()
@@ -95,9 +104,11 @@ def initialize_medusa(input_ids, model: ort.InferenceSession, config, device, us
 
 def tree_decoding(
     model: ort.InferenceSession,
+    config,
     tree_candidates,
     retrieve_indices,
-    medusa_attn_mask
+    medusa_attn_mask,
+    input_ids,
 ):
     # tree_medusa_logits, outputs, tree_logits = model(
     #     tree_candidates,
@@ -105,27 +116,45 @@ def tree_decoding(
     #     position_ids=position_ids,
     #     medusa_forward=True,
     # )
-    inputs = {
-        "input_ids": tree_candidates,
-        "medusa_attn_mask": medusa_attn_mask,
-    }
+    past_input_ids_len = input_ids.shape[1]
+    tree_candidates = torch.cat(
+        [input_ids.expand(tree_candidates.shape[0], -1), tree_candidates], dim=1
+    )
     bsz = tree_candidates.shape[0]
     seq_len = tree_candidates.shape[1]
 
+    position_ids = torch.arange(
+        0, seq_len, dtype=torch.long
+    ).unsqueeze(0).expand(bsz, -1)
+    attention_mask = torch.ones((bsz, seq_len), dtype=torch.long,)
+
+
+    # Expand medusa_mask to enable casting
+    pad_to = max(0, seq_len - medusa_attn_mask.shape[-1])
+    medusa_attn_mask = torch.nn.functional.pad(medusa_attn_mask, (pad_to, 0, pad_to, 0), value=1)
+    medusa_attn_mask = medusa_attn_mask[:, :, :seq_len, :seq_len]
+    
+    inputs = {
+        "input_ids": tree_candidates,
+        "medusa_mask": medusa_attn_mask,
+        "position_ids": position_ids,
+        "attention_mask": attention_mask
+    }
+
     outputs = {
-        "logits": torch.zeros((bsz, seq_len, model.config.vocab_size), dtype=torch.float32),
-        "medusa_logits": torch.zeros((bsz, model.config.medusa_num_heads, model.config.medusa_num_choices), dtype=torch.float32),
+        "logits": torch.zeros((bsz, seq_len, config.vocab_size), dtype=torch.float16),
+        "medusa_logits": torch.zeros((config.medusa_num_heads, bsz, seq_len, config.vocab_size), dtype=torch.float16),
     }
     
-    io_binding = apply_io_binding(model, inputs, outputs, False, False)
+    io_binding = apply_io_binding(model, inputs, outputs, True, False)
     io_binding.synchronize_inputs()
     model.run_with_iobinding(io_binding)
     io_binding.synchronize_outputs()
 
 
     # Reorder the obtained logits based on the retrieve_indices to ensure consistency with some reference ordering.
-    logits = outputs['logits'][0, retrieve_indices]
-    medusa_logits = outputs['medusa_logits'][:, 0, retrieve_indices]
+    logits = outputs['logits'][0, past_input_ids_len + retrieve_indices]
+    medusa_logits = outputs['medusa_logits'][:, 0, past_input_ids_len + retrieve_indices]
     return medusa_logits, logits
 
 
@@ -169,7 +198,6 @@ class MedusaModel:
 
         Warning: Only support batch size 1 for now!!
         """
-        assert input_ids.shape[0] == 1, "Only support batch size 1 for now!!"
         # Avoid modifying the input_ids in-place
         input_ids = input_ids.clone()
 
@@ -193,9 +221,8 @@ class MedusaModel:
         reset_medusa_mode(self)
         # Initialize tree attention mask and process prefill tokens
         medusa_logits, logits = initialize_medusa(
-            input_ids, self.model, self.config, 'cpu', True
+            input_ids, self.model, self.config, 'cpu', True, medusa_buffers["medusa_attn_mask"]
         )
-
         new_token = 0
         last_round_token = 0
 
@@ -217,9 +244,11 @@ class MedusaModel:
             # Use tree attention to verify the candidates and get predictions
             medusa_logits, logits = tree_decoding(
                 self.model, 
+                self.config,
                 tree_candidates,
                 medusa_buffers["retrieve_indices"],
-                medusa_buffers["medusa_attn_mask"]
+                medusa_buffers["medusa_attn_mask"],
+                input_ids
             )
 
             # Evaluate the posterior of the candidates to select the accepted candidate prefix
@@ -255,12 +284,6 @@ class MedusaModel:
     def __init__(self, onnx_model_path, sess_options, ep, model_name, cache_dir):
         self.model = ort.InferenceSession(onnx_model_path, sess_options=sess_options, providers=[ep])
 
-        self.config = AutoConfig.from_pretrained(model_name, use_auth_token=True, cache_dir=cache_dir)
-        self.tokenizer = AutoConfig.from_pretrained(model_name, use_auth_token=True, cache_dir=cache_dir)
+        self.config = MedusaConfig.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
         self.base_model_name_or_path = model_name
-
-        medusa_num_heads = self.config.medusa_num_heads
-        medusa_num_layers = self.config.medusa_num_layers
-
-        self.medusa = medusa_num_heads
-        self.medusa_num_layers = medusa_num_layers

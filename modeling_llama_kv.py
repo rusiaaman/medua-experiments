@@ -348,12 +348,14 @@ class LlamaAttention(nn.Module):
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
+        # [MODIFIED] Using KVCache mechanism for preallocated GPU memory optimization
+        # past_key_value is utilized to leverage previously computed key and value states.
+        # If past_key_value is available, reuse the states for k, v, and self_attention.
         if past_key_value is not None:
-            # reuse k, v, self_attention
-            key_states = torch.cat([past_key_value[0], key_states], dim=2)
-            value_states = torch.cat([past_key_value[1], value_states], dim=2)
-
-        past_key_value = (key_states, value_states) if use_cache else None
+            key_states = past_key_value[0].cat(key_states, dim=2)
+            value_states = past_key_value[1].cat(value_states, dim=2)
+        # Reset past_key_value to avoid return past_key_value.
+        past_key_value = None
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -810,11 +812,13 @@ class LlamaModel(LlamaPreTrainedModel):
                 expanded_attn_mask if combined_attention_mask is None else expanded_attn_mask + combined_attention_mask
             )
 
-        # [MODIFIED] add medusa mask
-        medusa_len = medusa_mask.size(-1)
-        combined_attention_mask[:, :, -medusa_len:, -medusa_len:][
-            medusa_mask == 0
-        ] = torch.finfo(inputs_embeds.dtype).min
+        # # [MODIFIED] add medusa mask
+        combined_attention_mask = torch.where(
+            medusa_mask == 0,
+            torch.finfo(inputs_embeds.dtype).min,
+            combined_attention_mask
+        )
+
 
         return combined_attention_mask
 
@@ -824,8 +828,8 @@ class LlamaModel(LlamaPreTrainedModel):
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
         medusa_mask: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
@@ -879,14 +883,10 @@ class LlamaModel(LlamaPreTrainedModel):
                 padding_mask = attention_mask
             else:
                 padding_mask = None
-
         attention_mask = self._prepare_decoder_attention_mask(
             attention_mask, (batch_size, seq_length), inputs_embeds, past_key_values_length,
             medusa_mask
         )
-        # [MODIFIED] 
-        self.attention_mask = attention_mask
-        self.position_ids = position_ids
 
         hidden_states = inputs_embeds
 
@@ -993,8 +993,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
         medusa_mask: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
@@ -1159,8 +1159,8 @@ class LlamaForSequenceClassification(LlamaPreTrainedModel):
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
         medusa_mask: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
